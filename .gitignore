@@ -1,0 +1,16 @@
+# cz
+/LOCAL.*
+/build/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# vim
+*~
+
+# log
+*.log

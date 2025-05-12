@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""
+Example toml
+------------
+deploy_ssh = "app@gotenberg-0.us-west-2.ctzen.net"
+ecr_repo = "545574418078.dkr.ecr.us-west-2.amazonaws.com/app/gotenberg/gotenberg:latest"
+
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import toml
+from czlib import *
+
+try:
+    PATH = subprocess.check_output(['git', 'rev-parse', '--show-toplevel']).decode().strip()
+except subprocess.CalledProcessError:
+    print("Error: Not in a git repository")
+    sys.exit(1)
+
+os.chdir(PATH)
+
+with open('LOCAL.toml', 'r') as f:
+    config = toml.load(f)
+   
+
+DEPLOY_SSH = config.get('deploy_ssh')
+ECR_REPO = config.get('ecr_repo')
+
+if not DEPLOY_SSH:
+    print("Error: deploy_ssh not found in LOCAL.toml")
+    sys.exit(1)
+if not ECR_REPO:
+    print("Error: ecr_repo not found in LOCAL.toml")
+    sys.exit(1)
+
+
+parser = argparse.ArgumentParser(description='cz: Git repository management tool')
+subparsers = parser.add_subparsers(dest='command', required=True)
+
+subparsers.add_parser('build', help='Build Docker image and compose file')
+deploy_parser = subparsers.add_parser('deploy', help='Deploy to remote server')
+deploy_parser.add_argument('-v', '--verbose', action='store_true', help='Print SSH script before execution')
+
+args = parser.parse_args()
+
+
+
+
+
+def run_build(args):
+    build_dir = os.path.join(PATH, 'build')
+    gotenberg_dir = os.path.join(build_dir, 'gotenberg')
+    
+    # Delete and recreate build directory
+    if os.path.exists(build_dir):
+        shutil.rmtree(build_dir)
+
+    os.makedirs(gotenberg_dir)
+    
+    # Write docker-compose.yaml with inlined content
+    with open(os.path.join(build_dir, 'docker-compose.yaml'), 'w') as f:
+        f.write(SL('''
+            services:
+                gotenberg:
+                    image: ''' +  ECR_REPO + '''
+                    ports:
+                    - "3000:3000"
+                    restart: unless-stopped
+            '''))
+    
+    # Write Dockerfile with inlined content
+    with open(os.path.join(gotenberg_dir, 'Dockerfile'), 'w') as f:
+        f.write(SL('''
+            FROM gotenberg/gotenberg:8
+        '''))
+    
+    # Run docker build
+    cmd = [
+        'docker', 'build', '-t',
+        ECR_REPO,
+        gotenberg_dir
+    ]
+    
+    subprocess.check_call(cmd)
+
+
+def run_deploy(args):
+    with open(os.path.join(PATH, 'build', 'docker-compose.yaml'), 'r') as f:
+        compose_content = f.read()
+    
+    # Do not use SL because of injected content
+    ssh_script = (
+        '''cat << 'EOF123' > docker-compose.yaml''' + "\n" +
+        compose_content + "\n" +
+        '''EOF123''' + "\n" +
+        '''docker compose pull''' + "\n" +
+        '''docker compose up -d''' + "\n" +
+        '''docker system prune -f''' + "\n"
+    )
+
+    if args.verbose:
+        print("SSH script to be executed:")
+        print("==========================")
+        print(ssh_script)
+        print("==========================")
+
+    
+    # Push the image
+    cmd = ['docker', 'push', ECR_REPO]
+    subprocess.check_call(cmd)
+
+    # Deploy    
+    cmd = ['ssh', DEPLOY_SSH, ssh_script]
+    subprocess.check_call(cmd)
+
+
+
+
+if args.command == 'build':
+    run_build(args)
+elif args.command == 'deploy':
+    run_deploy(args)
+
+
+
