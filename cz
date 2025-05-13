@@ -2,8 +2,9 @@
 """
 Example toml
 ------------
-deploy_ssh = "app@gotenberg-0.us-west-2.ctzen.net"
-ecr_repo = "545574418078.dkr.ecr.us-west-2.amazonaws.com/app/gotenberg/gotenberg:latest"
+deploy_host = "gotenberg-0.app.us-west-2.ctzen.net"
+deploy_ssh_user = "app"
+ecr_repo = "545574418078.dkr.ecr.us-west-2.amazonaws.com/app/gotenberg-0/"
 
 """
 
@@ -27,15 +28,24 @@ with open('LOCAL.toml', 'r') as f:
     config = toml.load(f)
    
 
-DEPLOY_SSH = config.get('deploy_ssh')
+DEPLOY_HOST = config.get('deploy_host')
+DEPLOY_SSH_USER = config.get('deploy_ssh_user')
 ECR_REPO = config.get('ecr_repo')
 
-if not DEPLOY_SSH:
-    print("Error: deploy_ssh not found in LOCAL.toml")
+if not DEPLOY_HOST:
+    print("Error: deploy_host not found in LOCAL.toml")
+    sys.exit(1)
+if not DEPLOY_SSH_USER:
+    print("Error: deploy_ssh_user not found in LOCAL.toml")
     sys.exit(1)
 if not ECR_REPO:
     print("Error: ecr_repo not found in LOCAL.toml")
     sys.exit(1)
+
+
+GOTENBERG_ECR_PATH = ECR_REPO + "gotenberg:latest"
+PROMETHEUS_ECR_PATH = ECR_REPO + "prometheus:latest"
+TRAEFIK_ECR_PATH = ECR_REPO + "traefik:latest"
 
 
 parser = argparse.ArgumentParser(description='cz: Git repository management tool')
@@ -54,22 +64,87 @@ args = parser.parse_args()
 def run_build(args):
     build_dir = os.path.join(PATH, 'build')
     gotenberg_dir = os.path.join(build_dir, 'gotenberg')
+    prometheus_dir = os.path.join(build_dir, 'prometheus')
+    traefik_dir = os.path.join(build_dir, 'traefik')
     
     # Delete and recreate build directory
     if os.path.exists(build_dir):
         shutil.rmtree(build_dir)
 
     os.makedirs(gotenberg_dir)
-    
+    os.makedirs(prometheus_dir)
+    os.makedirs(traefik_dir)
+        
     # Write docker-compose.yaml with inlined content
     with open(os.path.join(build_dir, 'docker-compose.yaml'), 'w') as f:
         f.write(SL('''
+            name: gotenberg
             services:
                 gotenberg:
-                    image: ''' +  ECR_REPO + '''
-                    ports:
-                    - "3000:3000"
+                    image: ''' +  GOTENBERG_ECR_PATH + '''
+                    command: [
+                        'gotenberg',
+                        '--libreoffice-disable-routes=true',
+                        '--chromium-auto-start=true',
+                        '--chromium-ignore-certificate-errors=true',
+                        '--chromium-disable-web-security=true',
+                        '--chromium-restart-after=100'
+                    ]
+                    expose:
+                        - 3000
                     restart: unless-stopped
+                    networks:
+                        - gotenberg-network
+                    labels:
+                        - "traefik.enable=true"
+                        - "traefik.http.routers.gotenberg.rule=Host(`''' + DEPLOY_HOST + '''`)"
+                        - "traefik.http.routers.gotenberg.entrypoints=web"
+                        - "traefik.http.services.gotenberg.loadbalancer.server.port=3000"
+                    healthcheck:
+                        test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+                        interval: 30s
+                        timeout: 10s
+                        retries: 3
+                    deploy:
+                        replicas: 3
+                        resources:
+                            limits:
+                                cpus: '0.8'
+                                memory: 1.5G
+                traefik:
+                    image: ''' +  TRAEFIK_ECR_PATH + '''
+                    command:
+                        - "--api.insecure=true"
+                        - "--providers.docker=true"
+                        - "--providers.docker.exposedbydefault=false"
+                        - "--entrypoints.web.address=:3000"
+                        - "--metrics.prometheus=true"
+                        - "--metrics.prometheus.addEntryPointsLabels=true"
+                        - "--metrics.prometheus.addServicesLabels=true"
+                        - "--entryPoints.metrics.address=:8082"
+                    ports:
+                        - "3000:3000"
+                        - "8080:8080" # Traefik dashboard
+                        - "8082:8082" # Metrics
+                    volumes:
+                        - /var/run/docker.sock:/var/run/docker.sock
+                    networks:
+                        - gotenberg-network
+                prometheus:
+                    image: ''' +  PROMETHEUS_ECR_PATH + '''
+                    command:
+                        - "--config.file=/etc/prometheus/prometheus.yml"
+                        - "--web.enable-lifecycle"
+                    ports:
+                        - "9090:9090"
+                    networks:
+                        - gotenberg-network
+                    depends_on:
+                        - gotenberg
+                        - traefik
+            networks:
+                gotenberg-network:
+                    driver: bridge
             '''))
     
     # Write Dockerfile with inlined content
@@ -77,12 +152,70 @@ def run_build(args):
         f.write(SL('''
             FROM gotenberg/gotenberg:8
         '''))
-    
+  
     # Run docker build
     cmd = [
         'docker', 'build', '-t',
-        ECR_REPO,
+        GOTENBERG_ECR_PATH,
         gotenberg_dir
+    ]
+    
+    subprocess.check_call(cmd)
+    
+    # Write Dockerfile with inlined content
+    with open(os.path.join(prometheus_dir, 'Dockerfile'), 'w') as f:
+        f.write(SL('''
+            # Dockerfile for custom Prometheus image
+            FROM prom/prometheus:v2.53.4
+            
+            # Copy prometheus.yml into the image
+            COPY prometheus.yml /etc/prometheus/prometheus.yml
+        '''))
+
+    with open(os.path.join(prometheus_dir, 'prometheus.yml'), 'w') as f:
+        f.write(SL('''
+            global:
+              scrape_interval: 15s
+              evaluation_interval: 15s
+            
+            scrape_configs:
+              - job_name: "gotenberg"
+                dns_sd_configs:
+                  - names:
+                      - "tasks.gotenberg"
+                    type: A
+                    port: 3000
+                metrics_path: /prometheus/metrics
+              - job_name: "traefik"
+                static_configs:
+                  - targets: ["traefik:8082"]
+                metrics_path: /metrics
+              - job_name: "prometheus"
+                static_configs:
+                  - targets: ["localhost:9090"]
+        '''))
+
+    # Run docker build
+    cmd = [
+        'docker', 'build', '-t',
+        PROMETHEUS_ECR_PATH,
+        prometheus_dir
+    ]
+ 
+    subprocess.check_call(cmd)
+   
+
+    # Write Dockerfile with inlined content
+    with open(os.path.join(traefik_dir, 'Dockerfile'), 'w') as f:
+        f.write(SL('''
+            FROM traefik:v3.4
+        '''))
+  
+    # Run docker build
+    cmd = [
+        'docker', 'build', '-t',
+        TRAEFIK_ECR_PATH,
+        traefik_dir
     ]
     
     subprocess.check_call(cmd)
@@ -110,11 +243,15 @@ def run_deploy(args):
 
     
     # Push the image
-    cmd = ['docker', 'push', ECR_REPO]
+    cmd = ['docker', 'push', GOTENBERG_ECR_PATH]
+    subprocess.check_call(cmd)
+    cmd = ['docker', 'push', PROMETHEUS_ECR_PATH]
+    subprocess.check_call(cmd)
+    cmd = ['docker', 'push', TRAEFIK_ECR_PATH]
     subprocess.check_call(cmd)
 
     # Deploy    
-    cmd = ['ssh', DEPLOY_SSH, ssh_script]
+    cmd = ['ssh', DEPLOY_SSH_USER + "@" + DEPLOY_HOST, ssh_script]
     subprocess.check_call(cmd)
 
 
